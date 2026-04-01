@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -67,6 +68,8 @@ pub struct AgentInfo {
 /// A defined agent (from .claude/agents/*.md or plugin).
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
+    /// Backing markdown file path.
+    pub file_path: PathBuf,
     /// Agent name.
     pub name: String,
     /// Source: "user" | "plugin:{name}" | "builtin".
@@ -81,6 +84,105 @@ pub struct AgentDefinition {
     pub tools: Vec<String>,
     /// If another agent overrides this one.
     pub shadowed_by: Option<String>,
+    /// Markdown body / instructions.
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentEditorField {
+    Name,
+    Model,
+    Memory,
+    Tools,
+    Description,
+    Prompt,
+}
+
+impl AgentEditorField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Model,
+            Self::Model => Self::Memory,
+            Self::Memory => Self::Tools,
+            Self::Tools => Self::Description,
+            Self::Description => Self::Prompt,
+            Self::Prompt => Self::Name,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Prompt,
+            Self::Model => Self::Name,
+            Self::Memory => Self::Model,
+            Self::Tools => Self::Memory,
+            Self::Description => Self::Tools,
+            Self::Prompt => Self::Description,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentEditorState {
+    pub original_index: Option<usize>,
+    pub name: String,
+    pub model: String,
+    pub memory_scope: String,
+    pub tools: String,
+    pub description: String,
+    pub prompt: String,
+    pub selected_field: AgentEditorField,
+    pub error: Option<String>,
+    pub saved_message: Option<String>,
+}
+
+impl AgentEditorState {
+    pub fn new() -> Self {
+        Self {
+            original_index: None,
+            name: String::new(),
+            model: "claude-sonnet-4-6".to_string(),
+            memory_scope: String::new(),
+            tools: String::new(),
+            description: String::new(),
+            prompt: String::new(),
+            selected_field: AgentEditorField::Name,
+            error: None,
+            saved_message: None,
+        }
+    }
+
+    pub fn from_definition(def: Option<(usize, &AgentDefinition)>) -> Self {
+        match def {
+            Some((idx, def)) => Self {
+                original_index: Some(idx),
+                name: def.name.clone(),
+                model: def
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+                memory_scope: def.memory_scope.clone().unwrap_or_default(),
+                tools: def.tools.join(", "),
+                description: def.description.clone(),
+                prompt: def.instructions.clone(),
+                selected_field: AgentEditorField::Name,
+                error: None,
+                saved_message: None,
+            },
+            None => Self::new(),
+        }
+    }
+
+    fn selected_text_mut(&mut self) -> &mut String {
+        match self.selected_field {
+            AgentEditorField::Name => &mut self.name,
+            AgentEditorField::Model => &mut self.model,
+            AgentEditorField::Memory => &mut self.memory_scope,
+            AgentEditorField::Tools => &mut self.tools,
+            AgentEditorField::Description => &mut self.description,
+            AgentEditorField::Prompt => &mut self.prompt,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +209,8 @@ pub struct AgentsMenuState {
     pub active_agents: Vec<AgentInfo>,
     pub list_scroll: usize,
     pub selected_row: usize,
+    pub project_root: Option<PathBuf>,
+    pub editor: AgentEditorState,
 }
 
 impl AgentsMenuState {
@@ -118,6 +222,8 @@ impl AgentsMenuState {
             active_agents: Vec::new(),
             list_scroll: 0,
             selected_row: 0,
+            project_root: None,
+            editor: AgentEditorState::new(),
         }
     }
 
@@ -126,6 +232,7 @@ impl AgentsMenuState {
         self.selected_row = 0;
         self.list_scroll = 0;
         self.route = AgentsRoute::List;
+        self.project_root = Some(project_root.to_path_buf());
         self.open = true;
     }
 
@@ -147,14 +254,19 @@ impl AgentsMenuState {
     }
 
     pub fn confirm_selection(&mut self) {
-        if self.selected_row == 0 {
-            // [+ Create new agent]
-            self.route = AgentsRoute::Editor(None);
-        } else {
-            let idx = self.selected_row - 1;
-            if idx < self.definitions.len() {
-                self.route = AgentsRoute::Detail(idx);
+        match self.route {
+            AgentsRoute::List => {
+                if self.selected_row == 0 {
+                    self.open_editor(None);
+                } else {
+                    let idx = self.selected_row - 1;
+                    if idx < self.definitions.len() {
+                        self.route = AgentsRoute::Detail(idx);
+                    }
+                }
             }
+            AgentsRoute::Detail(idx) => self.open_editor(Some(idx)),
+            AgentsRoute::Editor(_) => {}
         }
     }
 
@@ -167,6 +279,73 @@ impl AgentsMenuState {
                 self.close();
             }
         }
+    }
+
+    pub fn open_editor(&mut self, idx: Option<usize>) {
+        self.editor = AgentEditorState::from_definition(
+            idx.and_then(|index| self.definitions.get(index).map(|def| (index, def))),
+        );
+        self.route = AgentsRoute::Editor(idx);
+    }
+
+    pub fn editor_insert_char(&mut self, ch: char) {
+        let field = self.editor.selected_text_mut();
+        field.push(ch);
+        self.editor.error = None;
+        self.editor.saved_message = None;
+    }
+
+    pub fn editor_backspace(&mut self) {
+        self.editor.selected_text_mut().pop();
+    }
+
+    pub fn editor_insert_newline(&mut self) {
+        match self.editor.selected_field {
+            AgentEditorField::Description | AgentEditorField::Prompt => {
+                self.editor.selected_text_mut().push('\n');
+            }
+            _ => self.editor.selected_field = self.editor.selected_field.next(),
+        }
+    }
+
+    pub fn editor_next_field(&mut self) {
+        self.editor.selected_field = self.editor.selected_field.next();
+    }
+
+    pub fn editor_prev_field(&mut self) {
+        self.editor.selected_field = self.editor.selected_field.prev();
+    }
+
+    pub fn save_editor(&mut self) -> Result<String, String> {
+        validate_editor(&self.editor)?;
+        let root = self
+            .project_root
+            .clone()
+            .ok_or_else(|| "Project root is unavailable.".to_string())?;
+        let file_path = self
+            .editor
+            .original_index
+            .and_then(|idx| self.definitions.get(idx).map(|def| def.file_path.clone()))
+            .unwrap_or_else(|| {
+                root.join(".claude")
+                    .join("agents")
+                    .join(format!("{}.md", slugify_agent_name(&self.editor.name)))
+            });
+
+        write_editor_to_disk(&file_path, &self.editor)?;
+        self.definitions = load_agent_definitions(&root);
+
+        let saved_idx = self
+            .definitions
+            .iter()
+            .position(|def| def.file_path == file_path)
+            .unwrap_or(0);
+        self.selected_row = saved_idx + 1;
+        self.route = AgentsRoute::Detail(saved_idx);
+        let msg = format!("Saved agent to {}", file_path.display());
+        self.editor.saved_message = Some(msg.clone());
+        self.editor.error = None;
+        Ok(msg)
     }
 }
 
@@ -208,16 +387,17 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
-    let (name, model, memory, description, tools) = if content.starts_with("---") {
+    let (name, model, memory, description, tools, instructions) = if content.starts_with("---") {
         let end = content[3..].find("\n---")? + 3;
         let front = &content[3..end];
+        let body = content[end + 4..].trim().to_string();
         let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
         let model = extract_yaml_str(front, "model");
         let memory = extract_yaml_str(front, "memory_scope")
             .or_else(|| extract_yaml_str(front, "memory"));
         let desc = extract_yaml_str(front, "description").unwrap_or_default();
         let tools = extract_yaml_list(front, "tools");
-        (name, model, memory, desc, tools)
+        (name, model, memory, desc, tools, body)
     } else {
         (
             stem,
@@ -225,10 +405,12 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
             None,
             content.lines().next().unwrap_or("").to_string(),
             vec![],
+            content.trim().to_string(),
         )
     };
 
     Some(AgentDefinition {
+        file_path: path.to_path_buf(),
         name,
         source: "user".to_string(),
         model,
@@ -236,6 +418,7 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
         description,
         tools,
         shadowed_by: None,
+        instructions,
     })
 }
 
@@ -272,6 +455,74 @@ fn extract_yaml_list(front: &str, key: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn slugify_agent_name(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, ' ' | '-' | '_' | '.') && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn validate_editor(editor: &AgentEditorState) -> Result<(), String> {
+    let name = editor.name.trim();
+    if name.is_empty() {
+        return Err("Agent name is required.".to_string());
+    }
+    if slugify_agent_name(name).is_empty() {
+        return Err("Agent name must contain letters or numbers.".to_string());
+    }
+    if editor.model.trim().is_empty() {
+        return Err("Model is required.".to_string());
+    }
+    if editor.description.trim().is_empty() {
+        return Err("Description is required.".to_string());
+    }
+    if editor.prompt.trim().is_empty() {
+        return Err("Prompt body is required.".to_string());
+    }
+    Ok(())
+}
+
+fn serialize_editor(editor: &AgentEditorState) -> String {
+    let tools = editor
+        .tools
+        .split(',')
+        .map(|tool| tool.trim())
+        .filter(|tool| !tool.is_empty())
+        .map(|tool| format!("\"{}\"", tool))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("name: {}\n", editor.name.trim()));
+    out.push_str(&format!("model: {}\n", editor.model.trim()));
+    if !editor.memory_scope.trim().is_empty() {
+        out.push_str(&format!("memory_scope: {}\n", editor.memory_scope.trim()));
+    }
+    out.push_str(&format!("description: {}\n", editor.description.trim()));
+    if !tools.is_empty() {
+        out.push_str(&format!("tools: [{}]\n", tools));
+    }
+    out.push_str("---\n\n");
+    out.push_str(editor.prompt.trim());
+    out.push('\n');
+    out
+}
+
+fn write_editor_to_disk(path: &Path, editor: &AgentEditorState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
+    }
+    std::fs::write(path, serialize_editor(editor))
+        .map_err(|err| format!("Failed to write {}: {}", path.display(), err))
+}
+
 // ---------------------------------------------------------------------------
 // Rendering: Agents Menu overlay
 // ---------------------------------------------------------------------------
@@ -303,11 +554,11 @@ pub fn render_agents_menu(state: &AgentsMenuState, area: Rect, buf: &mut Buffer)
                 render_agent_detail(def, dialog_area, buf);
             }
         }
-        AgentsRoute::Editor(Some(idx)) => {
-            render_agent_editor(state.definitions.get(*idx), dialog_area, buf);
+        AgentsRoute::Editor(Some(_idx)) => {
+            render_agent_editor(state, dialog_area, buf);
         }
         AgentsRoute::Editor(None) => {
-            render_agent_editor(None, dialog_area, buf);
+            render_agent_editor(state, dialog_area, buf);
         }
     }
 }
@@ -469,8 +720,8 @@ fn render_agent_detail(def: &AgentDefinition, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
-fn render_agent_editor(def: Option<&AgentDefinition>, area: Rect, buf: &mut Buffer) {
-    let title = if def.is_some() {
+fn render_agent_editor(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
+    let title = if state.editor.original_index.is_some() {
         " Edit Agent "
     } else {
         " Create Agent "
@@ -488,40 +739,93 @@ fn render_agent_editor(def: Option<&AgentDefinition>, area: Rect, buf: &mut Buff
         height: area.height.saturating_sub(2),
     };
 
-    let name = def.map(|d| d.name.as_str()).unwrap_or("my-agent");
-    let model = def
-        .and_then(|d| d.model.as_deref())
-        .unwrap_or("claude-sonnet-4-6");
-    let desc = def.map(|d| d.description.as_str()).unwrap_or("");
+    let editor = &state.editor;
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Name:   ", Style::default().fg(Color::DarkGray)),
-            Span::raw(name.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Model:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(model.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Desc:   ", Style::default().fg(Color::DarkGray)),
-            Span::raw(desc.to_string()),
-        ]),
+    let field_style = |field: AgentEditorField| {
+        if editor.selected_field == field {
+            selected_style
+        } else {
+            normal_style
+        }
+    };
+
+    let mut lines = vec![
+        render_editor_field("Name", &editor.name, field_style(AgentEditorField::Name)),
+        render_editor_field("Model", &editor.model, field_style(AgentEditorField::Model)),
+        render_editor_field(
+            "Memory",
+            &editor.memory_scope,
+            field_style(AgentEditorField::Memory),
+        ),
+        render_editor_field("Tools", &editor.tools, field_style(AgentEditorField::Tools)),
+        render_editor_field(
+            "Description",
+            &editor.description,
+            field_style(AgentEditorField::Description),
+        ),
         Line::default(),
         Line::from(vec![Span::styled(
-            "Edit the agent file directly in .claude/agents/<name>.md",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]),
-        Line::default(),
-        Line::from(vec![Span::styled(
-            "[Esc] back",
+            "Prompt",
             Style::default().fg(Color::DarkGray),
         )]),
     ];
 
+    let prompt_style = field_style(AgentEditorField::Prompt);
+    let prompt_lines = if editor.prompt.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            "(empty)",
+            prompt_style.add_modifier(Modifier::ITALIC),
+        )])]
+    } else {
+        editor
+            .prompt
+            .lines()
+            .map(|line| Line::from(vec![Span::styled(line.to_string(), prompt_style)]))
+            .collect::<Vec<_>>()
+    };
+    lines.extend(prompt_lines);
+    lines.push(Line::default());
+
+    if let Some(msg) = editor.saved_message.as_ref() {
+        lines.push(Line::from(vec![Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Green),
+        )]));
+    }
+    if let Some(err) = editor.error.as_ref() {
+        lines.push(Line::from(vec![Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(vec![Span::styled(
+        "Tab/Up/Down move • Enter adds newline for text fields • Ctrl+S save • Esc back",
+        Style::default().fg(Color::DarkGray),
+    )]));
+
     Paragraph::new(lines).render(inner, buf);
+}
+
+fn render_editor_field(label: &str, value: &str, value_style: Style) -> Line<'static> {
+    let display = if value.is_empty() {
+        "(empty)".to_string()
+    } else {
+        value.to_string()
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<11}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(display, value_style),
+    ])
 }
 
 // ---------------------------------------------------------------------------

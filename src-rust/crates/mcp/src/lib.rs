@@ -678,6 +678,15 @@ pub struct McpManager {
     failed_servers: Vec<(String, String)>, // (name, error)
 }
 
+#[derive(Debug, Clone)]
+pub struct McpServerCatalog {
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub prompt_count: usize,
+    pub resources: Vec<String>,
+    pub prompts: Vec<String>,
+}
+
 impl McpManager {
     pub fn new() -> Self {
         Self {
@@ -793,6 +802,18 @@ impl McpManager {
     /// Each entry is `(server_name, error_message)`.
     pub fn failed_servers(&self) -> &[(String, String)] {
         &self.failed_servers
+    }
+
+    /// Return counts and names for tools/resources/prompts on connected servers.
+    pub fn server_catalog(&self, name: &str) -> Option<McpServerCatalog> {
+        let client = self.clients.get(name)?;
+        Some(McpServerCatalog {
+            tool_count: client.tools.len(),
+            resource_count: client.resources.len(),
+            prompt_count: client.prompts.len(),
+            resources: client.resources.iter().map(|r| r.name.clone()).collect(),
+            prompts: client.prompts.iter().map(|p| p.name.clone()).collect(),
+        })
     }
 
     // -----------------------------------------------------------------------

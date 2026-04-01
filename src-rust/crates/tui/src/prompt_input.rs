@@ -14,8 +14,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget},
 };
+
+const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+const PROMPT_POINTER: &str = "\u{276f}";
 
 // ---------------------------------------------------------------------------
 // Vim mode
@@ -468,104 +471,114 @@ impl Default for PromptInputState {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Render the prompt input widget.
-pub fn render_prompt_input(state: &PromptInputState, area: Rect, buf: &mut Buffer, focused: bool) {
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
-    let readonly = state.mode == InputMode::Readonly;
+/// Render the prompt input widget in the same low-chrome style as Claude Code:
+/// one live input row plus an accent underline. Suggestions are rendered by the
+/// footer, not as a boxed dropdown here.
+pub fn render_prompt_input(
+    state: &PromptInputState,
+    area: Rect,
+    buf: &mut Buffer,
+    focused: bool,
+    mode: InputMode,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
 
-    // Build title
-    let title = if state.vim_enabled {
-        format!(" {} ", state.vim_mode.label())
-    } else if readonly {
-        " (readonly) ".to_string()
+    let accent = match mode {
+        InputMode::Readonly => Color::DarkGray,
+        InputMode::Plan => Color::Yellow,
+        InputMode::Default => CLAUDE_ORANGE,
+    };
+    let prompt_prefix = if mode == InputMode::Readonly {
+        "x ".to_string()
     } else {
-        String::new()
+        format!("{PROMPT_POINTER} ")
     };
+    let available_width = area.width.saturating_sub(prompt_prefix.chars().count() as u16) as usize;
+    let cursor = if focused { "\u{2588}" } else { "" };
 
-    Block::default()
-        .title(title.as_str())
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .render(area, buf);
-
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-
-    // Render text with cursor
-    let mut lines = Vec::new();
-    let text_with_cursor = if focused {
-        let mut t = state.text.clone();
-        if state.cursor <= t.len() {
-            t.insert(state.cursor, '\u{2502}');
+    let mut content = if state.text.is_empty() {
+        if focused {
+            cursor.to_string()
         } else {
-            t.push('\u{2502}');
+            "Type a message... (/ for commands)".to_string()
         }
-        t
+    } else if focused && state.cursor <= state.text.len() {
+        let mut text = state.text.clone();
+        text.insert_str(state.cursor, cursor);
+        text
     } else {
         state.text.clone()
     };
 
-    for line in text_with_cursor.lines() {
-        lines.push(Line::from(vec![Span::raw(line.to_string())]));
-    }
-    if lines.is_empty() && !focused {
-        lines.push(Line::from(vec![
-            Span::styled("Type a message… (/ for commands)", Style::default().fg(Color::DarkGray)),
-        ]));
+    if content.contains('\n') {
+        let lines: Vec<&str> = content.lines().collect();
+        content = lines.last().copied().unwrap_or_default().to_string();
     }
 
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(inner, buf);
+    let visible_content: String = content
+        .chars()
+        .rev()
+        .take(available_width)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
 
-    // Token count (bottom-right corner, shown when > 1000 chars)
-    if state.text.len() > 1000 {
-        let count_str = format!("~{}t", state.token_estimate);
-        let x = area.x + area.width.saturating_sub(count_str.len() as u16 + 2);
-        let y = area.y + area.height.saturating_sub(1);
-        Paragraph::new(Line::from(vec![
-            Span::styled(count_str, Style::default().fg(Color::DarkGray)),
-        ])).render(Rect { x, y, width: 8, height: 1 }, buf);
-    }
-
-    // Typeahead dropdown (above the input box)
-    if !state.suggestions.is_empty() && focused {
-        render_typeahead(state, area, buf);
-    }
-}
-
-fn render_typeahead(state: &PromptInputState, area: Rect, buf: &mut Buffer) {
-    let max_visible = 6.min(state.suggestions.len());
-    let h = max_visible as u16 + 2;
-    let y = area.y.saturating_sub(h);
-    let w = area.width.min(50);
-
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .render(Rect { x: area.x, y, width: w, height: h }, buf);
-
-    for (i, suggestion) in state.suggestions.iter().take(max_visible).enumerate() {
-        let selected = state.suggestion_index == Some(i);
-        let style = if selected {
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::White)
+        let mut line_spans = vec![Span::styled(
+        prompt_prefix,
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+    line_spans.push(Span::styled(
+        visible_content,
+        if state.text.is_empty() && !focused {
+            Style::default().fg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::Gray)
-        };
-        let prefix = if selected { "> " } else { "  " };
-        let avail = (w as usize).saturating_sub(suggestion.text.len() + 4);
-        let desc: String = suggestion.description.chars().take(avail).collect();
-        let line = Line::from(vec![
-            Span::styled(prefix, style),
-            Span::styled(suggestion.text.clone(), style),
-            Span::styled(format!("  {}", desc), Style::default().fg(Color::DarkGray)),
-        ]);
-        Paragraph::new(line).render(
-            Rect { x: area.x + 1, y: y + 1 + i as u16, width: w.saturating_sub(2), height: 1 },
+            Style::default().fg(Color::White)
+        },
+    ));
+
+    Paragraph::new(Line::from(line_spans)).render(
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+        buf,
+    );
+
+    if area.height > 1 {
+        Paragraph::new(Line::from(vec![Span::styled(
+            "\u{2500}".repeat(area.width as usize),
+            Style::default().fg(accent),
+        )]))
+        .render(
+            Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
+
+    if state.text.len() > 1000 && area.height > 0 {
+        let count_str = format!("~{}t", state.token_estimate);
+        let x = area.x + area.width.saturating_sub(count_str.len() as u16);
+        Paragraph::new(Line::from(vec![Span::styled(
+            count_str,
+            Style::default().fg(Color::DarkGray),
+        )]))
+        .render(
+            Rect {
+                x,
+                y: area.y,
+                width: area.width.saturating_sub(x.saturating_sub(area.x)),
+                height: 1,
+            },
             buf,
         );
     }

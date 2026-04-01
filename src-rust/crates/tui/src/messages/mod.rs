@@ -10,6 +10,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 mod markdown;
 pub use markdown::render_markdown;
@@ -37,6 +38,10 @@ impl Default for RenderContext {
 /// A styled line for rendering.
 pub type StyledLine<'a> = Line<'a>;
 
+const MAX_USER_PROMPT_DISPLAY_CHARS: usize = 10_000;
+const TRUNCATE_USER_PROMPT_HEAD_CHARS: usize = 2_500;
+const TRUNCATE_USER_PROMPT_TAIL_CHARS: usize = 2_500;
+
 /// Render a code block with optional language label. Uses basic styling
 /// since full syntect integration is behind a feature flag.
 pub fn render_code_block(lang: Option<&str>, code: &str, _width: u16) -> Vec<Line<'static>> {
@@ -61,12 +66,13 @@ pub fn render_code_block(lang: Option<&str>, code: &str, _width: u16) -> Vec<Lin
 
 /// Render an assistant text message body.
 pub fn render_assistant_text(text: &str, ctx: &RenderContext) -> Vec<Line<'static>> {
-    render_markdown(text, ctx.width)
+    render_markdown(text, ctx.width.saturating_sub(3))
 }
 
 /// Render a user text message body.
 fn render_user_text_with_ctx(text: &str, ctx: &RenderContext) -> Vec<Line<'static>> {
-    render_markdown(text, ctx.width)
+    let truncated = truncate_user_prompt_text(text);
+    render_markdown(&truncated, ctx.width.saturating_sub(3))
 }
 
 /// Legacy public helper retained for snapshot tests.
@@ -254,27 +260,77 @@ pub fn render_hook_progress(command: &str, last_line: Option<&str>) -> Vec<Line<
     lines
 }
 
-fn render_message_header(role: &Role, width: u16) -> Line<'static> {
-    let (prefix, style) = match role {
+fn truncate_user_prompt_text(text: &str) -> String {
+    if text.len() <= MAX_USER_PROMPT_DISPLAY_CHARS {
+        return text.to_string();
+    }
+
+    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
+    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+    let tail = &text[tail_start..];
+    let hidden_lines = text
+        .chars()
+        .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
+        .filter(|c| *c == '\n')
+        .count()
+        .saturating_sub(tail.chars().filter(|c| *c == '\n').count());
+
+    format!("{head}\n… +{hidden_lines} lines …\n{tail}")
+}
+
+fn prefix_message_lines(
+    mut rendered: Vec<Line<'static>>,
+    role: &Role,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if rendered.is_empty() {
+        return rendered;
+    }
+
+    let (prefix, prefix_style, body_style) = match role {
         Role::User => (
-            "You",
+            "› ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(215, 119, 87))
                 .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
         ),
         Role::Assistant => (
-            "Claude",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            "\u{2022} ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
         ),
     };
 
-    let hr_len = (width as usize).saturating_sub(prefix.len() + 4);
-    Line::from(vec![
-        Span::styled(format!("  {} ", prefix), style),
-        Span::styled("-".repeat(hr_len), Style::default().fg(Color::DarkGray)),
-    ])
+    if let Some(first) = rendered.first_mut() {
+        let mut spans = Vec::with_capacity(first.spans.len() + 1);
+        spans.push(Span::styled(prefix.to_string(), prefix_style));
+        spans.extend(first.spans.clone());
+        first.spans = spans;
+    }
+
+    if *role == Role::User {
+        let background = Color::Rgb(52, 52, 52);
+        for line in &mut rendered {
+            let mut line_width = 0usize;
+            for span in &mut line.spans {
+                line_width += span.content.width();
+                if span.style.fg.is_none() {
+                    span.style = body_style;
+                }
+                span.style = span.style.bg(background);
+            }
+            let pad = (width as usize).saturating_sub(line_width.min(width as usize));
+            if pad > 0 {
+                line.spans.push(Span::styled(
+                    " ".repeat(pad),
+                    Style::default().bg(background),
+                ));
+            }
+        }
+    }
+
+    rendered
 }
 
 fn flush_text(lines: &mut Vec<Line<'static>>, role: &Role, text: &mut String, ctx: &RenderContext) {
@@ -283,8 +339,8 @@ fn flush_text(lines: &mut Vec<Line<'static>>, role: &Role, text: &mut String, ct
     }
 
     let rendered = match role {
-        Role::User => render_markdown(text, ctx.width),
-        Role::Assistant => render_assistant_text(text, ctx),
+        Role::User => prefix_message_lines(render_markdown(text, ctx.width), role, ctx.width),
+        Role::Assistant => prefix_message_lines(render_assistant_text(text, ctx), role, ctx.width),
     };
     lines.extend(rendered);
     text.clear();
@@ -324,7 +380,7 @@ fn render_attachment_line(kind: &str, label: String) -> Vec<Line<'static>> {
 }
 
 pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> {
-    let mut lines = vec![render_message_header(&msg.role, ctx.width)];
+    let mut lines = Vec::new();
     let mut pending_text = String::new();
 
     for block in msg.content_blocks() {
@@ -337,29 +393,45 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             }
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_thinking_block(&thinking, ctx.show_thinking));
+                lines.extend(prefix_message_lines(
+                    render_thinking_block(&thinking, ctx.show_thinking),
+                    &msg.role,
+                    ctx.width,
+                ));
             }
             ContentBlock::RedactedThinking { .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.push(Line::from(vec![Span::styled(
-                    "> Thinking redacted",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )]));
+                lines.extend(prefix_message_lines(
+                    vec![Line::from(vec![Span::styled(
+                        "Thinking redacted",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )])],
+                    &msg.role,
+                    ctx.width,
+                ));
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                lines.extend(render_tool_use(&name, &input.to_string()));
+                lines.extend(prefix_message_lines(
+                    render_tool_use(&name, &input.to_string()),
+                    &msg.role,
+                    ctx.width,
+                ));
             }
             ContentBlock::ToolResult { content, is_error, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let text = tool_result_text(&content);
-                lines.extend(if is_error.unwrap_or(false) {
-                    render_tool_result_error(&text)
-                } else {
-                    render_tool_result_success(&text, false)
-                });
+                lines.extend(prefix_message_lines(
+                    if is_error.unwrap_or(false) {
+                        render_tool_result_error(&text)
+                    } else {
+                        render_tool_result_success(&text, false)
+                    },
+                    &msg.role,
+                    ctx.width,
+                ));
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
@@ -368,7 +440,11 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     .clone()
                     .or(source.media_type.clone())
                     .unwrap_or_else(|| "embedded image".to_string());
-                lines.extend(render_attachment_line("Image", label));
+                lines.extend(prefix_message_lines(
+                    render_attachment_line("Image", label),
+                    &msg.role,
+                    ctx.width,
+                ));
             }
             ContentBlock::Document { title, context, source, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
@@ -377,7 +453,11 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     .or(source.url)
                     .or(source.media_type)
                     .unwrap_or_else(|| "attached document".to_string());
-                lines.extend(render_attachment_line("Document", label));
+                lines.extend(prefix_message_lines(
+                    render_attachment_line("Document", label),
+                    &msg.role,
+                    ctx.width,
+                ));
             }
         }
     }
@@ -428,7 +508,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Claude"));
+        assert!(rendered.contains("\u{2022} "));
         assert!(rendered.contains("Thinking"));
         assert!(rendered.contains("read_file"));
         assert!(rendered.contains("Result"));
@@ -436,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn render_message_renders_user_text_under_user_header() {
+    fn render_message_renders_user_text_in_brief_prompt_style() {
         let msg = Message::user("hello from user");
         let ctx = RenderContext::default();
 
@@ -446,8 +526,25 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("You"));
         assert!(rendered.contains("hello from user"));
+        assert!(!rendered.contains("You"));
+    }
+
+    #[test]
+    fn render_user_text_truncates_large_prompts() {
+        let msg = Message::user(format!("{}\nquestion", "a".repeat(12_000)));
+        let ctx = RenderContext::default();
+
+        let rendered = render_message(&msg, &ctx)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("question"));
+        assert!(rendered.contains(&"a".repeat(40)));
     }
 }
+
+
 

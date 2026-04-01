@@ -4,6 +4,7 @@
 //! Shows a two-pane diff dialog: file list (left) + unified diff detail (right).
 //! Keyboard: ↑↓ navigate files, Tab switch pane, t toggle diff type, Esc close.
 
+use cc_core::file_history::FileHistory;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,6 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,8 @@ pub enum DiffPane {
 pub struct DiffViewerState {
     /// All files in the diff.
     pub files: Vec<FileDiffStats>,
+    /// Cached turn-specific files, populated externally.
+    pub turn_files: Vec<FileDiffStats>,
     /// Currently selected file index.
     pub selected_file: usize,
     /// Active pane.
@@ -109,6 +113,7 @@ impl DiffViewerState {
     pub fn new() -> Self {
         Self {
             files: Vec::new(),
+            turn_files: Vec::new(),
             selected_file: 0,
             active_pane: DiffPane::FileList,
             diff_type: DiffType::GitDiff,
@@ -120,11 +125,12 @@ impl DiffViewerState {
 
     /// Open the dialog and load diffs from the project root.
     pub fn open(&mut self, project_root: &std::path::Path) {
-        self.files = load_git_diff(project_root);
-        self.selected_file = 0;
-        self.detail_scroll = 0;
-        self.render_cache.clear();
-        self.open = true;
+        self.open_for_type(DiffType::GitDiff, project_root);
+    }
+
+    /// Open directly in turn-diff mode.
+    pub fn open_turn(&mut self, project_root: &std::path::Path) {
+        self.open_for_type(DiffType::TurnDiff, project_root);
     }
 
     pub fn close(&mut self) {
@@ -157,14 +163,7 @@ impl DiffViewerState {
             DiffType::GitDiff => DiffType::TurnDiff,
             DiffType::TurnDiff => DiffType::GitDiff,
         };
-        // Reload diff for the new type
-        self.files = match self.diff_type {
-            DiffType::GitDiff => load_git_diff(project_root),
-            DiffType::TurnDiff => Vec::new(), // Turn diff populated externally
-        };
-        self.selected_file = 0;
-        self.detail_scroll = 0;
-        self.render_cache.clear();
+        self.reload_files(project_root);
     }
 
     pub fn scroll_detail_up(&mut self) {
@@ -173,6 +172,32 @@ impl DiffViewerState {
 
     pub fn scroll_detail_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(3);
+    }
+
+    pub fn set_turn_diff(&mut self, files: Vec<FileDiffStats>) {
+        self.turn_files = files;
+        if self.diff_type == DiffType::TurnDiff {
+            self.files = self.turn_files.clone();
+            self.selected_file = 0;
+            self.detail_scroll = 0;
+            self.render_cache.clear();
+        }
+    }
+
+    fn open_for_type(&mut self, diff_type: DiffType, project_root: &std::path::Path) {
+        self.diff_type = diff_type;
+        self.reload_files(project_root);
+        self.open = true;
+    }
+
+    fn reload_files(&mut self, project_root: &std::path::Path) {
+        self.files = match self.diff_type {
+            DiffType::GitDiff => load_git_diff(project_root),
+            DiffType::TurnDiff => self.turn_files.clone(),
+        };
+        self.selected_file = 0;
+        self.detail_scroll = 0;
+        self.render_cache.clear();
     }
 }
 
@@ -208,6 +233,138 @@ pub fn load_git_diff(project_root: &std::path::Path) -> Vec<FileDiffStats> {
     };
 
     parse_unified_diff(&text)
+}
+
+/// Build a turn-local diff from file-history snapshots.
+pub fn build_turn_diff(
+    file_history: &FileHistory,
+    turn_index: usize,
+    project_root: &std::path::Path,
+) -> Vec<FileDiffStats> {
+    file_history
+        .snapshots_for_turn(turn_index)
+        .into_iter()
+        .map(|snapshot| {
+            let path = relative_diff_path(&snapshot.path, project_root);
+            if snapshot.binary {
+                return FileDiffStats {
+                    path,
+                    added: 0,
+                    removed: 0,
+                    binary: true,
+                    hunks: Vec::new(),
+                };
+            }
+
+            let before = snapshot.before_text.as_deref().unwrap_or("");
+            let after = snapshot.after_text.as_deref().unwrap_or("");
+            build_file_diff_from_snapshots(path, before, after)
+        })
+        .filter(|file| file.binary || !file.hunks.is_empty())
+        .collect()
+}
+
+pub fn build_latest_turn_diff(
+    file_history: &FileHistory,
+    project_root: &std::path::Path,
+) -> Vec<FileDiffStats> {
+    let Some(turn_index) = file_history.latest_turn_index() else {
+        return Vec::new();
+    };
+    build_turn_diff(file_history, turn_index, project_root)
+}
+
+fn relative_diff_path(path: &std::path::Path, project_root: &std::path::Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn build_file_diff_from_snapshots(path: String, before: &str, after: &str) -> FileDiffStats {
+    let diff = TextDiff::from_lines(before, after);
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    let mut hunks = Vec::new();
+
+    for group in diff.grouped_ops(3) {
+        let mut lines = Vec::new();
+
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                let mut content = change.to_string();
+                if content.ends_with('\n') {
+                    content.pop();
+                    if content.ends_with('\r') {
+                        content.pop();
+                    }
+                }
+
+                let kind = match change.tag() {
+                    ChangeTag::Equal => DiffLineKind::Context,
+                    ChangeTag::Delete => {
+                        removed += 1;
+                        DiffLineKind::Removed
+                    }
+                    ChangeTag::Insert => {
+                        added += 1;
+                        DiffLineKind::Added
+                    }
+                };
+
+                lines.push(DiffLine {
+                    kind,
+                    content,
+                    old_line_no: change.old_index().map(|idx| idx as u32 + 1),
+                    new_line_no: change.new_index().map(|idx| idx as u32 + 1),
+                });
+            }
+        }
+
+        let old_range = summarize_old_range(&lines);
+        let new_range = summarize_new_range(&lines);
+        lines.insert(
+            0,
+            DiffLine {
+                kind: DiffLineKind::Header,
+                content: format!(
+                    "@@ -{},{} +{},{} @@",
+                    old_range.0, old_range.1, new_range.0, new_range.1
+                ),
+                old_line_no: None,
+                new_line_no: None,
+            },
+        );
+
+        hunks.push(DiffHunk {
+            old_range,
+            new_range,
+            lines,
+        });
+    }
+
+    FileDiffStats {
+        path,
+        added,
+        removed,
+        binary: false,
+        hunks,
+    }
+}
+
+fn summarize_old_range(lines: &[DiffLine]) -> (u32, u32) {
+    summarize_range(lines.iter().filter_map(|line| line.old_line_no).collect())
+}
+
+fn summarize_new_range(lines: &[DiffLine]) -> (u32, u32) {
+    summarize_range(lines.iter().filter_map(|line| line.new_line_no).collect())
+}
+
+fn summarize_range(line_numbers: Vec<u32>) -> (u32, u32) {
+    match (line_numbers.first().copied(), line_numbers.last().copied()) {
+        (Some(start), Some(end)) => (start, end.saturating_sub(start) + 1),
+        _ => (0, 0),
+    }
 }
 
 /// Parse unified diff text into `Vec<FileDiffStats>`.
@@ -340,7 +497,7 @@ fn parse_hunk_header(line: &str) -> (u32, u32, u32, u32) {
 
 /// Render the diff dialog overlay.
 pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buffer) {
-    if !state.open || state.files.is_empty() {
+    if !state.open {
         return;
     }
 
@@ -356,8 +513,8 @@ pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buf
 
     // Outer border
     let title = match state.diff_type {
-        DiffType::GitDiff => " Diff (git) [t: toggle, Tab: pane, Esc: close] ",
-        DiffType::TurnDiff => " Diff (turn) [t: toggle, Tab: pane, Esc: close] ",
+        DiffType::GitDiff => " Diff (git) [d: toggle, Tab: pane, Esc: close] ",
+        DiffType::TurnDiff => " Diff (turn) [d: toggle, Tab: pane, Esc: close] ",
     };
     Block::default()
         .title(title)
@@ -371,6 +528,27 @@ pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buf
         width: dialog_area.width.saturating_sub(2),
         height: dialog_area.height.saturating_sub(2),
     };
+
+    if state.files.is_empty() {
+        let empty = match state.diff_type {
+            DiffType::GitDiff => "No git changes available.",
+            DiffType::TurnDiff => "No turn changes available yet.",
+        };
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                empty,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "No tracked file changes were captured for the selected turn.",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ])
+        .render(inner, buf);
+        return;
+    }
 
     // Split: file list 30%, detail 70%
     let panes = Layout::default()

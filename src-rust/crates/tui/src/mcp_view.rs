@@ -56,6 +56,8 @@ pub struct McpServerView {
     pub tool_count: usize,
     pub resource_count: usize,
     pub prompt_count: usize,
+    pub resources: Vec<String>,
+    pub prompts: Vec<String>,
     pub error_message: Option<String>,
     /// All tools provided by this server.
     pub tools: Vec<McpToolView>,
@@ -256,7 +258,13 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
                 Span::styled(prefix, style),
                 Span::styled(server.status.badge().to_string(), Style::default().fg(server.status.color())),
                 Span::styled(format!(" {}", server.name), style),
-                Span::styled(format!("  {} tools", server.tool_count), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "  {} tools  {} res  {} prompts",
+                        server.tool_count, server.resource_count, server.prompt_count
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]);
             Paragraph::new(line).render(Rect { x: area.x, y: area.y + *row, width: area.width, height: 1 }, buf);
             if let Some(err) = &server.error_message {
@@ -349,7 +357,49 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         }
     }
 
+    if let Some(server) = state.servers.iter().find(|server| server.name == tool.server) {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "Server: {}  [{}]  {} resources  {} prompts",
+                server.name,
+                server.status.label(),
+                server.resource_count,
+                server.prompt_count
+            ),
+            Style::default().fg(server.status.color()),
+        )]));
+
+        if !server.resources.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "Resources:",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            for resource in server.resources.iter().take(3) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  - {}", resource),
+                    Style::default().fg(Color::White),
+                )]));
+            }
+        }
+
+        if !server.prompts.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "Prompts:",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            for prompt in server.prompts.iter().take(3) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  - {}", prompt),
+                    Style::default().fg(Color::White),
+                )]));
+            }
+        }
+    }
+
     Paragraph::new(lines)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .render(inner, buf);
 }
+
+

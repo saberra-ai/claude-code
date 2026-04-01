@@ -11,6 +11,7 @@ use cc_core::types::ToolDefinition;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
@@ -185,6 +186,8 @@ pub struct ToolContext {
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
     pub session_id: String,
+    pub file_history: Arc<parking_lot::Mutex<cc_core::file_history::FileHistory>>,
+    pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
     pub non_interactive: bool,
     /// Optional MCP manager for ListMcpResources / ReadMcpResource tools.
@@ -225,6 +228,26 @@ impl ToolContext {
                 tool_name
             ))),
         }
+    }
+
+    pub fn current_turn_index(&self) -> usize {
+        self.current_turn.load(Ordering::Relaxed)
+    }
+
+    pub fn record_file_change(
+        &self,
+        path: PathBuf,
+        before_content: &[u8],
+        after_content: &[u8],
+        tool_name: &str,
+    ) {
+        self.file_history.lock().record_modification(
+            path,
+            before_content,
+            after_content,
+            self.current_turn_index(),
+            tool_name,
+        );
     }
 }
 
@@ -444,6 +467,10 @@ mod tests {
             permission_handler: handler,
             cost_tracker: cc_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                cc_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
@@ -468,6 +495,10 @@ mod tests {
             permission_handler: handler,
             cost_tracker: cc_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                cc_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),

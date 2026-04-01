@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use cc_core::types::ToolDefinition;
 use cc_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use clap::{ArgAction, Parser, ValueEnum};
+use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -425,19 +426,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let cost_tracker = CostTracker::new();
     let session_id = uuid::Uuid::new_v4().to_string();
+    let file_history = Arc::new(ParkingMutex::new(
+        cc_core::file_history::FileHistory::new(),
+    ));
+    let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
-    let mcp_manager_arc: Option<Arc<cc_mcp::McpManager>> = if !config.mcp_servers.is_empty() {
-        info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
-        let mcp_manager = cc_mcp::McpManager::connect_all(&config.mcp_servers).await;
-        if mcp_manager.server_count() > 0 {
-            Some(Arc::new(mcp_manager))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
@@ -445,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         permission_handler: permission_handler.clone(),
         cost_tracker: cost_tracker.clone(),
         session_id: session_id.clone(),
+        file_history: file_history.clone(),
+        current_turn: current_turn.clone(),
         non_interactive: cli.print || cli.prompt.is_some(),
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
@@ -453,25 +450,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools: Arc<Vec<Box<dyn cc_tools::Tool>>> = {
-        let mut v: Vec<Box<dyn cc_tools::Tool>> = cc_tools::all_tools();
-        v.push(Box::new(cc_query::AgentTool));
-
-        // Register MCP server tools as wrappers.
-        if let Some(ref manager_arc) = mcp_manager_arc {
-            for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-                let wrapper = McpToolWrapper {
-                    tool_def,
-                    server_name,
-                    manager: manager_arc.clone(),
-                };
-                v.push(Box::new(wrapper));
-            }
-            debug!(total_tools = v.len(), "MCP tools registered");
-        }
-
-        Arc::new(v)
-    };
+    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -549,6 +528,39 @@ async fn main() -> anyhow::Result<()> {
 
     cron_cancel.cancel();
     result
+}
+
+async fn connect_mcp_manager_arc(
+    config: &Config,
+) -> Option<Arc<cc_mcp::McpManager>> {
+    if config.mcp_servers.is_empty() {
+        return None;
+    }
+
+    info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
+    let mcp_manager = cc_mcp::McpManager::connect_all(&config.mcp_servers).await;
+    Some(Arc::new(mcp_manager))
+}
+
+fn build_tools_with_mcp(
+    mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+) -> Arc<Vec<Box<dyn cc_tools::Tool>>> {
+    let mut v: Vec<Box<dyn cc_tools::Tool>> = cc_tools::all_tools();
+    v.push(Box::new(cc_query::AgentTool));
+
+    if let Some(ref manager_arc) = mcp_manager {
+        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
+            let wrapper = McpToolWrapper {
+                tool_def,
+                server_name,
+                manager: manager_arc.clone(),
+            };
+            v.push(Box::new(wrapper));
+        }
+        debug!(total_tools = v.len(), "MCP tools registered");
+    }
+
+    Arc::new(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +813,12 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
-    app.messages = initial_messages.clone();
+    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
+    if let Some(manager) = tool_ctx.mcp_manager.clone() {
+        app.attach_mcp_manager(manager);
+    }
+    app.replace_messages(initial_messages.clone());
 
     // Bridge runtime channels — Some when bridge is configured and started.
     //
@@ -850,7 +867,7 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    let tools_arc = tools;
+    let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -859,6 +876,8 @@ async fn run_interactive(
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
 
     'main: loop {
+        app.frame_count = app.frame_count.wrapping_add(1);
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -892,7 +911,7 @@ async fn run_interactive(
                     // Ctrl+D on empty input => quit
                     if key.code == KeyCode::Char('d')
                         && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                        && app.input.is_empty()
+                        && app.prompt_input.is_empty()
                     {
                         break 'main;
                     }
@@ -911,7 +930,7 @@ async fn run_interactive(
                                 Some(CommandResult::Exit) => break 'main,
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
-                                    app.messages.clear();
+                                    app.replace_messages(Vec::new());
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
@@ -920,7 +939,7 @@ async fn run_interactive(
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed = messages.len().saturating_sub(new_msgs.len());
                                     messages = new_msgs.clone();
-                                    app.messages = new_msgs;
+                                    app.replace_messages(new_msgs);
                                     session.messages = messages.clone();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message = Some(format!(
@@ -930,7 +949,7 @@ async fn run_interactive(
                                     ));
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
-                                    app.messages = messages.clone();
+                                    app.replace_messages(messages.clone());
                                     app.open_rewind_flow();
                                     app.status_message =
                                         Some("Select a message to rewind to.".to_string());
@@ -938,10 +957,14 @@ async fn run_interactive(
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
                                     messages = session.messages.clone();
-                                    app.messages = messages.clone();
+                                    app.replace_messages(messages.clone());
                                     cmd_ctx.config.model = Some(session.model.clone());
                                     app.config.model = Some(session.model.clone());
                                     tool_ctx.session_id = session.id.clone();
+                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                        cc_core::file_history::FileHistory::new(),
+                                    ));
+                                    tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = session.title.clone();
                                     if let Some(saved_dir) = session.working_dir.as_ref() {
@@ -951,6 +974,11 @@ async fn run_interactive(
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
+                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.attach_turn_diff_state(
+                                        tool_ctx.file_history.clone(),
+                                        tool_ctx.current_turn.clone(),
+                                    );
                                     app.status_message = Some(format!(
                                         "Resumed session {}.",
                                         &session.id[..8]
@@ -965,8 +993,7 @@ async fn run_interactive(
                                         Some(format!("Session renamed to \"{}\".", title));
                                 }
                                 Some(CommandResult::Message(msg)) => {
-                                    app.messages
-                                        .push(cc_core::types::Message::assistant(msg));
+                                    app.push_message(cc_core::types::Message::assistant(msg));
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     cmd_ctx.config = new_cfg.clone();
@@ -982,8 +1009,7 @@ async fn run_interactive(
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Inject as user turn
                                     messages.push(cc_core::types::Message::user(msg.clone()));
-                                    app.messages
-                                        .push(cc_core::types::Message::user(msg));
+                                    app.push_message(cc_core::types::Message::user(msg));
                                     // Fall through to send to model
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
@@ -1037,8 +1063,7 @@ async fn run_interactive(
 
                         // Regular user message
                         messages.push(cc_core::types::Message::user(input.clone()));
-                        app.messages
-                            .push(cc_core::types::Message::user(input.clone()));
+                        app.push_message(cc_core::types::Message::user(input.clone()));
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
 
@@ -1201,7 +1226,7 @@ async fn run_interactive(
                         app.set_prompt_text(content.clone());
                         // Push as a user message and fire a query immediately.
                         messages.push(cc_core::types::Message::user(content.clone()));
-                        app.messages.push(cc_core::types::Message::user(content.clone()));
+                        app.push_message(cc_core::types::Message::user(content.clone()));
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
                         app.is_streaming = true;
@@ -1324,6 +1349,30 @@ async fn run_interactive(
                 // Save session
                 let _ = cc_core::history::save_session(&session).await;
             }
+        }
+
+        if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
+            let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
+            tool_ctx.mcp_manager = new_mcp_manager.clone();
+            app.mcp_manager = new_mcp_manager.clone();
+            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            if app.mcp_view.open {
+                app.refresh_mcp_view();
+            }
+
+            let connected = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
+            app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
+                "No MCP servers configured.".to_string()
+            } else {
+                format!(
+                    "Reconnected MCP runtime ({} connected server{}).",
+                    connected,
+                    if connected == 1 { "" } else { "s" }
+                )
+            });
         }
 
         if app.should_quit {
@@ -1602,3 +1651,4 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
         None => serde_json::Value::Null,
     }
 }
+

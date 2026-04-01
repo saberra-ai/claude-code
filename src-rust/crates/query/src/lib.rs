@@ -412,6 +412,9 @@ pub async fn run_query_loop(
 
     loop {
         turn += 1;
+        tool_ctx
+            .current_turn
+            .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
         if turn > config.max_turns {
             info!(turns = turn, "Max turns reached");
             if let Some(ref tx) = event_tx {

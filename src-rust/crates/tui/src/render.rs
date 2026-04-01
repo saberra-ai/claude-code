@@ -1,4 +1,6 @@
-// render.rs — All ratatui rendering logic.
+﻿// render.rs â€” All ratatui rendering logic.
+
+use std::cell::RefCell;
 
 use crate::agents_view::render_agents_menu;
 use crate::app::{App, EffortLevel, SystemAnnotation, SystemMessageStyle, ToolStatus};
@@ -28,8 +30,11 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-// Braille spinner sequence
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// ASCII spinner sequence. We keep this ASCII-only to avoid Windows source
+// encoding surprises while still giving the prompt/status row visible motion.
+const SPINNER: &[char] = &['-', '\\', '|', '/'];
+const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+const WELCOME_BOX_HEIGHT: u16 = 11;
 
 fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
@@ -74,6 +79,25 @@ fn flatten_line_text(line: &Line<'_>) -> String {
         .join("")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MessageLinesCacheKey {
+    width: u16,
+    messages_ptr: usize,
+    messages_len: usize,
+    annotations_ptr: usize,
+    annotations_len: usize,
+}
+
+#[derive(Clone)]
+struct MessageLinesCache {
+    key: MessageLinesCacheKey,
+    lines: Vec<RenderedLineItem>,
+}
+
+thread_local! {
+    static MESSAGE_LINES_CACHE: RefCell<Option<MessageLinesCache>> = const { RefCell::new(None) };
+}
+
 // -----------------------------------------------------------------------
 // Top-level layout
 // -----------------------------------------------------------------------
@@ -89,22 +113,35 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         size,
     );
 
-    // Three-row layout matching the real Claude Code layout:
-    //   [messages/welcome — no borders]
-    //   [input — bottom border only, bare > prompt]
-    //   [footer — ? for shortcuts | effort/model]
+    let prompt_focused =
+        !app.is_streaming && app.permission_request.is_none() && !app.history_search_overlay.visible;
+    let status_height = if should_render_status_row(app) { 1 } else { 0 };
+    let suggestions_height = if prompt_focused && !app.prompt_input.suggestions.is_empty() {
+        app.prompt_input.suggestions.len().min(5) as u16
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),  // 1 text line + 1 bottom border + 1 blank
+            Constraint::Length(status_height),
+            Constraint::Length(3),
+            Constraint::Length(suggestions_height),
             Constraint::Length(1),
         ])
         .split(size);
 
     render_messages(frame, app, chunks[0]);
-    render_input(frame, app, chunks[1]);
-    render_footer(frame, app, chunks[2]);
+    if status_height > 0 {
+        render_status_row(frame, app, chunks[1]);
+    }
+    render_input(frame, app, chunks[2], prompt_focused);
+    if suggestions_height > 0 {
+        render_prompt_suggestions(frame, app, chunks[3]);
+    }
+    render_footer(frame, app, chunks[4]);
 
     // Overlays (rendered on top in Z-order)
 
@@ -122,7 +159,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if app.help_overlay.visible {
         render_help_overlay(frame, &app.help_overlay, size);
     } else if app.show_help {
-        // Legacy fallback — render the simple help overlay
+        // Legacy fallback â€” render the simple help overlay
         render_simple_help_overlay(frame, size);
     }
 
@@ -131,7 +168,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_history_search_overlay(
             frame,
             &app.history_search_overlay,
-            &app.input_history,
+            &app.prompt_input.history,
             size,
         );
     } else if let Some(ref hs) = app.history_search {
@@ -193,7 +230,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         0
     };
 
-    let (hint_area, msg_area) = if hint_height > 0 && area.height > hint_height + 2 {
+    let (hint_area, content_area) = if hint_height > 0 && area.height > hint_height + 2 {
         let splits = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(hint_height), Constraint::Min(1)])
@@ -208,57 +245,26 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         render_plugin_hints(frame, &app.plugin_hints, ha);
     }
 
-    // Welcome screen: render the orange two-column box directly, then return.
-    if app.messages.is_empty() && app.streaming_text.is_empty() {
-        render_welcome_box(frame, app, msg_area);
+    let show_logo_header =
+        content_area.height >= WELCOME_BOX_HEIGHT + 3 && content_area.width >= 60;
+    let (logo_area, msg_area) = if show_logo_header {
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(WELCOME_BOX_HEIGHT), Constraint::Min(1)])
+            .split(content_area);
+        (Some(splits[0]), splits[1])
+    } else {
+        (None, content_area)
+    };
+
+    if let Some(la) = logo_area {
+        render_welcome_box(frame, app, la);
+    } else if app.messages.is_empty() && app.streaming_text.is_empty() {
+        render_welcome_box(frame, app, content_area);
         return;
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    {
-        // ── Conversation messages ────────────────────────────────────────────
-        // Merge real messages with system annotations in index order.
-        let total = app.messages.len();
-        for i in 0..=total {
-            // Emit any system annotations that fall at position `i`
-            // (i.e. after_index == i → they appear before message[i]).
-            for ann in app
-                .system_annotations
-                .iter()
-                .filter(|a| a.after_index == i)
-            {
-                render_system_annotation_lines(&mut lines, ann, msg_area.width as usize);
-            }
-
-            if i < total {
-                let msg = &app.messages[i];
-                render_message_lines(&mut lines, msg, msg_area.width as usize);
-            }
-        }
-
-        // Active tool-use blocks
-        for block in &app.tool_use_blocks {
-            render_tool_block_lines(&mut lines, block, app.frame_count);
-        }
-
-        // In-flight streaming text
-        if !app.streaming_text.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} Claude ", spinner_char(app.frame_count)),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "\u{2500}".repeat(msg_area.width.saturating_sub(12) as usize),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            let rendered = render_markdown(&app.streaming_text, msg_area.width);
-            lines.extend(rendered);
-        }
-    }
+    let lines = render_message_items(app, msg_area.width);
 
     // Compute total virtual height and apply scroll clamping.
     // When auto_scroll is on we always show the tail; otherwise we respect
@@ -279,19 +285,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let mut list = VirtualList::new();
     list.viewport_height = msg_area.height;
     list.sticky_bottom = app.auto_scroll;
-    list.set_items(
-        lines
-            .into_iter()
-            .map(|line| RenderedLineItem {
-                search_text: flatten_line_text(&line),
-                line,
-            })
-            .collect(),
-    );
+    list.set_items(lines);
     list.scroll_offset = scroll as u16;
     list.render(msg_area, frame.buffer_mut());
 
-    // "↓ N new messages" indicator when scrolled up and new messages arrived.
+    // "â†“ N new messages" indicator when scrolled up and new messages arrived.
     if app.new_messages_while_scrolled > 0 && msg_area.height > 4 && msg_area.width > 20 {
         let indicator = format!(
             " \u{2193} {} new message{} ",
@@ -313,16 +311,91 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             indicator,
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(CLAUDE_ORANGE)
                 .add_modifier(Modifier::BOLD),
         )]);
         frame.render_widget(Paragraph::new(vec![ind_line]), ind_area);
     }
 }
 
-// ── Welcome / startup screen ─────────────────────────────────────────────────
+fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    let cacheable = app.streaming_text.is_empty() && app.tool_use_blocks.is_empty();
+    let cache_key = MessageLinesCacheKey {
+        width,
+        messages_ptr: app.messages.as_ptr() as usize,
+        messages_len: app.messages.len(),
+        annotations_ptr: app.system_annotations.as_ptr() as usize,
+        annotations_len: app.system_annotations.len(),
+    };
 
-const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+    if cacheable {
+        if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|cached| cached.key == cache_key)
+                .map(|cached| cached.lines.clone())
+        }) {
+            return lines;
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    let total = app.messages.len();
+    for i in 0..=total {
+        for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+        }
+
+        if i < total {
+            render_message_lines(&mut lines, &app.messages[i], width as usize);
+        }
+    }
+
+    for block in &app.tool_use_blocks {
+        render_tool_block_lines(&mut lines, block, app.frame_count);
+    }
+
+    if !app.streaming_text.is_empty() {
+        let rendered = render_markdown(&app.streaming_text, width);
+        let mut first = true;
+        for line in rendered {
+            let mut spans = line.spans;
+            if first {
+                let mut prefixed = Vec::with_capacity(spans.len() + 1);
+                prefixed.push(Span::styled(
+                    "\u{2022} ",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+                prefixed.extend(spans);
+                spans = prefixed;
+                first = false;
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    let items = lines
+        .into_iter()
+        .map(|line| RenderedLineItem {
+            search_text: flatten_line_text(&line),
+            line,
+        })
+        .collect::<Vec<_>>();
+
+    if cacheable {
+        MESSAGE_LINES_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(MessageLinesCache {
+                key: cache_key,
+                lines: items.clone(),
+            });
+        });
+    }
+
+    items
+}
+
+// â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Render the two-column orange round-bordered welcome box (matches TS LogoV2).
 fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
@@ -346,7 +419,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // --- Box dimensions ---
     // The box should be at most the full area width, and a fixed height.
     let box_width = area.width.min(area.width);
-    let box_height: u16 = 11; // welcome box is ~11 rows tall
+    let box_height: u16 = WELCOME_BOX_HEIGHT;
     if area.height < box_height + 1 || box_width < 30 {
         // Too small: fall back to a single line
         let line = Line::from(vec![
@@ -455,7 +528,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(right_lines).wrap(Wrap { trim: false }), h_chunks[2]);
 }
 
-// ── Per-message rendering ─────────────────────────────────────────────────────
+// â”€â”€ Per-message rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn render_message_lines(lines: &mut Vec<Line<'static>>, msg: &cc_core::types::Message, width: usize) {
     let rendered = render_message(
@@ -467,7 +540,7 @@ fn render_message_lines(lines: &mut Vec<Line<'static>>, msg: &cc_core::types::Me
         },
     );
 
-    // Truncate very long outputs with a "… N more lines" notice
+    // Truncate very long outputs with a "â€¦ N more lines" notice
     const MAX_LINES_PER_MSG: usize = 200;
     if rendered.len() > MAX_LINES_PER_MSG {
         lines.extend(rendered[..MAX_LINES_PER_MSG].iter().cloned());
@@ -485,14 +558,14 @@ fn render_message_lines(lines: &mut Vec<Line<'static>>, msg: &cc_core::types::Me
     }
 }
 
-// ── System annotation (compact boundary, info notices) ───────────────────────
+// â”€â”€ System annotation (compact boundary, info notices) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn render_system_annotation_lines(
     lines: &mut Vec<Line<'static>>,
     ann: &SystemAnnotation,
     width: usize,
 ) {
-    // Compact boundary: show ✻ prefix with dimmed text
+    // Compact boundary: show âœ» prefix with dimmed text
     if ann.style == SystemMessageStyle::Compact {
         lines.push(Line::from(vec![
             Span::styled(
@@ -516,7 +589,7 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Compact => unreachable!(),
     };
 
-    // Centred, padded rule: "─── text ───"
+    // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"
     let text = ann.text.as_str();
     let inner_width = width.saturating_sub(4);
     let text_len = text.len();
@@ -541,7 +614,7 @@ fn render_system_annotation_lines(
     lines.push(Line::from(""));
 }
 
-// ── Tool use block ────────────────────────────────────────────────────────────
+// â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::ToolUseBlock, frame_count: u64) {
     let (icon, icon_style) = match block.status {
@@ -593,7 +666,7 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
                     ),
                 ]));
             } else if line_text.starts_with('\u{2026}') {
-                // "… N more lines" truncation marker
+                // "â€¦ N more lines" truncation marker
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
@@ -617,39 +690,77 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
 // Input pane
 // -----------------------------------------------------------------------
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let mut state = app.prompt_input.clone();
-    state.mode = if app.is_streaming {
-        InputMode::Readonly
-    } else if app.plan_mode {
-        InputMode::Plan
-    } else {
-        InputMode::Default
-    };
-
+fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     render_prompt_input(
-        &state,
+        &app.prompt_input,
         area,
         frame.buffer_mut(),
-        !app.is_streaming && app.permission_request.is_none() && !app.history_search_overlay.visible,
+        focused,
+        if app.is_streaming {
+            InputMode::Readonly
+        } else if app.plan_mode {
+            InputMode::Plan
+        } else {
+            InputMode::Default
+        },
     );
+}
+
+fn should_render_status_row(app: &App) -> bool {
+    app.is_streaming || app.voice_recording || app.status_message.is_some()
+}
+
+fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let spans = if app.voice_recording {
+        vec![Span::styled(
+            format!("{} Recording... press Alt+V to transcribe", figures::black_circle()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]
+    } else if app.is_streaming {
+        vec![
+            Span::styled(
+                spinner_char(app.frame_count).to_string(),
+                Style::default().fg(spinner_color(app)).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                app.status_message
+                    .as_deref()
+                    .unwrap_or("Thinking..."),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]
+    } else if let Some(status) = app.status_message.as_deref() {
+        vec![Span::styled(status, Style::default().fg(Color::DarkGray))]
+    } else {
+        Vec::new()
+    };
+
+    if spans.is_empty() {
+        return;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 // Keybinding hints footer
 // -----------------------------------------------------------------------
 
 /// Single footer line matching real Claude Code:
-///   Left:  "? for shortcuts" (dimmed)  — or streaming/mode context
-///   Right: "● high · /effort" (effort indicator + model)
+///   Left:  "? for shortcuts" (dimmed)  â€” or streaming/mode context
+///   Right: "â— high Â· /effort" (effort indicator + model)
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
     // Left side
-    let left_spans: Vec<Span> = if app.is_streaming {
-        vec![
-            Span::styled(spinner_char(app.frame_count).to_string(), Style::default().fg(spinner_color(app))),
-            Span::styled(" Thinking…  Ctrl+C to stop", Style::default().fg(Color::DarkGray)),
-        ]
-    } else if app.voice_recording {
+    let left_spans: Vec<Span> = if app.voice_recording {
         vec![Span::styled(
-            format!(" {} REC — speak now", figures::black_circle()),
+            format!(" {} REC â€” speak now", figures::black_circle()),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]
     } else {
@@ -659,7 +770,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         )]
     };
 
-    // Right side: effort glyph · effort name · /effort  (matches TS StatusLine)
+    // Right side: effort glyph Â· effort name Â· /effort  (matches TS StatusLine)
     let effort_glyph = match app.effort_level {
         EffortLevel::Low => figures::EFFORT_LOW,
         EffortLevel::Medium => figures::EFFORT_MEDIUM,
@@ -694,6 +805,48 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     spans.extend(right_spans);
 
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+}
+
+fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
+    let suggestions = &app.prompt_input.suggestions;
+    if suggestions.is_empty() || area.height == 0 {
+        return;
+    }
+
+    let selected = app.prompt_input.suggestion_index.unwrap_or(0);
+    let max_visible = area.height as usize;
+    let start = selected.saturating_sub(max_visible / 2).min(suggestions.len().saturating_sub(max_visible));
+    let end = (start + max_visible).min(suggestions.len());
+
+    for (row, suggestion) in suggestions[start..end].iter().enumerate() {
+        let is_selected = start + row == selected;
+        let prefix = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut spans = vec![
+            Span::styled(prefix, style),
+            Span::styled(suggestion.text.clone(), style),
+        ];
+        if !suggestion.description.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", suggestion.description),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: area.x,
+                y: area.y + row as u16,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -810,7 +963,8 @@ fn render_legacy_history_search(
             let real_idx = start + display_idx;
             let is_selected = real_idx == hs.selected;
             let entry = app
-                .input_history
+                .prompt_input
+                .history
                 .get(hist_idx)
                 .map(String::as_str)
                 .unwrap_or("");
@@ -885,7 +1039,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
             format!(" {} ", data.model),
             Style::default().fg(Color::Cyan),
         ));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(" â”‚ ", Style::default().fg(Color::DarkGray)));
     }
 
     // Context window
@@ -898,7 +1052,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
             format!("{}k/{}k ({:.0}%)", used_k, total_k, pct * 100.0),
             Style::default().fg(ctx_color),
         ));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(" â”‚ ", Style::default().fg(Color::DarkGray)));
     }
 
     // Cost
@@ -907,7 +1061,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
             format!("${:.2}", data.cost_cents / 100.0),
             Style::default().fg(Color::White),
         ));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(" â”‚ ", Style::default().fg(Color::DarkGray)));
     }
 
     // Compact warning
@@ -915,7 +1069,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
         if pct >= 0.80 {
             let color = if pct >= 0.95 { Color::Red } else { Color::Yellow };
             spans.push(Span::styled(
-                format!("⚠ ctx {:.0}% ", pct * 100.0),
+                format!("âš  ctx {:.0}% ", pct * 100.0),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
         }
@@ -948,7 +1102,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
     // Bridge connected
     if data.bridge_connected {
         spans.push(Span::styled(
-            "🔗 ",
+            "ðŸ”— ",
             Style::default().fg(Color::Green),
         ));
     }
@@ -975,3 +1129,4 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
         .style(Style::default().bg(Color::Black))
         .render(area, buf);
 }
+

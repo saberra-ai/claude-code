@@ -108,10 +108,15 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
 mod tests {
     use super::*;
     use app::{App, HistorySearch, ToolStatus, ToolUseBlock};
-    use dialogs::PermissionRequest;
     use cc_core::config::Config;
     use cc_core::cost::CostTracker;
+    use cc_core::file_history::FileHistory;
     use cc_core::types::{ContentBlock, Role, ToolResultContent};
+    use dialogs::PermissionRequest;
+    use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn make_app() -> App {
         App::new(Config::default(), CostTracker::new())
@@ -154,7 +159,7 @@ mod tests {
     #[test]
     fn test_take_input_pushes_history() {
         let mut app = make_app();
-        app.input = "hello".to_string();
+        app.set_prompt_text("hello".to_string());
         let result = app.take_input();
         assert_eq!(result, "hello");
         assert_eq!(app.input, "");
@@ -222,6 +227,60 @@ mod tests {
         assert_eq!(app.agents_menu.active_agents[2].status, AgentStatus::Complete);
     }
 
+    #[test]
+    fn test_agents_editor_ctrl_s_saves_new_agent() {
+        let temp = tempdir().unwrap();
+        let mut app = make_app();
+        app.agents_menu.open(temp.path());
+        app.agents_menu.open_editor(None);
+        app.agents_menu.editor.name = "Planner".to_string();
+        app.agents_menu.editor.description = "Plans complex work".to_string();
+        app.agents_menu.editor.prompt = "Help break work into steps.".to_string();
+
+        app.handle_key_event(ctrl(KeyCode::Char('s')));
+
+        let saved = temp.path().join(".claude").join("agents").join("planner.md");
+        assert!(saved.exists());
+        let content = std::fs::read_to_string(saved).unwrap();
+        assert!(content.contains("name: Planner"));
+        assert!(content.contains("Help break work into steps."));
+        assert!(matches!(app.agents_menu.route, agents_view::AgentsRoute::Detail(_)));
+    }
+
+    #[test]
+    fn test_agents_editor_render_uses_live_editor_state() {
+        let temp = tempdir().unwrap();
+        let mut state = AgentsMenuState::new();
+        state.open(temp.path());
+        state.open_editor(None);
+        state.editor.name = "Builder".to_string();
+        state.editor.description = "Builds code".to_string();
+        state.editor.prompt = "Ship the feature.".to_string();
+
+        let area = Rect { x: 0, y: 0, width: 90, height: 24 };
+        let mut buf = Buffer::empty(area);
+        agents_view::render_agents_menu(&state, area, &mut buf);
+
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("Builder"));
+        assert!(rendered.contains("Ship the feature."));
+        assert!(!rendered.contains("Edit the agent file directly"));
+    }
+
+    #[test]
+    fn test_changes_slash_command_opens_turn_diff_mode() {
+        let mut app = make_app();
+
+        assert!(app.intercept_slash_command("changes"));
+        assert!(app.diff_viewer.open);
+        assert_eq!(app.diff_viewer.diff_type, DiffType::TurnDiff);
+    }
+
     // ---- key handling ----------------------------------------------------
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -272,7 +331,7 @@ mod tests {
     #[test]
     fn test_ctrl_d_does_not_quit_with_input() {
         let mut app = make_app();
-        app.input = "abc".to_string();
+        app.set_prompt_text("abc".to_string());
         app.handle_key_event(ctrl(KeyCode::Char('d')));
         assert!(!app.should_quit);
     }
@@ -304,8 +363,7 @@ mod tests {
     #[test]
     fn test_backspace_removes_char() {
         let mut app = make_app();
-        app.input = "hello".to_string();
-        app.cursor_pos = 5;
+        app.set_prompt_text("hello".to_string());
         app.handle_key_event(key(KeyCode::Backspace));
         assert_eq!(app.input, "hell");
         assert_eq!(app.prompt_input.text, "hell");
@@ -314,7 +372,8 @@ mod tests {
     #[test]
     fn test_history_navigation() {
         let mut app = make_app();
-        app.input_history = vec!["first".to_string(), "second".to_string()];
+        app.prompt_input.history = vec!["first".to_string(), "second".to_string()];
+        app.input_history = app.prompt_input.history.clone();
         app.handle_key_event(key(KeyCode::Up));
         assert_eq!(app.input, "second");
         app.handle_key_event(key(KeyCode::Up));
@@ -329,9 +388,9 @@ mod tests {
     #[test]
     fn test_history_navigation_restores_draft() {
         let mut app = make_app();
-        app.input_history = vec!["first".to_string(), "second".to_string()];
-        app.input = "draft".to_string();
-        app.cursor_pos = app.input.len();
+        app.prompt_input.history = vec!["first".to_string(), "second".to_string()];
+        app.input_history = app.prompt_input.history.clone();
+        app.set_prompt_text("draft".to_string());
 
         app.handle_key_event(key(KeyCode::Up));
         assert_eq!(app.input, "second");
@@ -381,6 +440,142 @@ mod tests {
     }
 
     #[test]
+    fn test_render_app_keeps_logo_header_after_first_message() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.push_message(cc_core::types::Message::user("hello".to_string()));
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("Claude Code"));
+        assert!(rendered.contains("hello"));
+    }
+
+    #[test]
+    fn test_render_app_keeps_footer_visible_with_slash_suggestions() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.handle_key_event(key(KeyCode::Char('/')));
+        app.handle_key_event(key(KeyCode::Char('a')));
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("/agents"));
+        assert!(rendered.contains("? for shortcuts"));
+        assert!(rendered.contains("/effort"));
+    }
+
+    #[test]
+    fn test_turn_diff_toggle_uses_cached_turn_files() {
+        let mut state = DiffViewerState::new();
+        state.set_turn_diff(vec![diff_viewer::FileDiffStats {
+            path: "src/lib.rs".to_string(),
+            added: 2,
+            removed: 1,
+            binary: false,
+            hunks: vec![diff_viewer::DiffHunk {
+                old_range: (1, 1),
+                new_range: (1, 2),
+                lines: vec![diff_viewer::DiffLine {
+                    kind: diff_viewer::DiffLineKind::Header,
+                    content: "@@ -1,1 +1,2 @@".to_string(),
+                    old_line_no: None,
+                    new_line_no: None,
+                }],
+            }],
+        }]);
+
+        state.toggle_diff_type(std::path::Path::new("."));
+
+        assert_eq!(state.diff_type, DiffType::TurnDiff);
+        assert_eq!(state.files.len(), 1);
+        assert_eq!(state.files[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_build_turn_diff_from_history_snapshots() {
+        let mut history = FileHistory::new();
+        history.record_modification(
+            PathBuf::from("/workspace/src/lib.rs"),
+            b"fn old() {}\n",
+            b"fn new() {}\n",
+            3,
+            "FileEdit",
+        );
+
+        let files = diff_viewer::build_turn_diff(&history, 3, std::path::Path::new("/workspace"));
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert_eq!(files[0].added, 1);
+        assert_eq!(files[0].removed, 1);
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn test_changes_slash_command_refreshes_turn_history() {
+        let mut app = make_app();
+        let file_history = Arc::new(parking_lot::Mutex::new(FileHistory::new()));
+        let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        file_history.lock().record_modification(
+            PathBuf::from("src/lib.rs"),
+            b"fn before() {}\n",
+            b"fn after() {}\n",
+            1,
+            "FileEdit",
+        );
+        app.attach_turn_diff_state(file_history, current_turn);
+
+        assert!(app.intercept_slash_command("changes"));
+        assert_eq!(app.diff_viewer.diff_type, DiffType::TurnDiff);
+        assert_eq!(app.diff_viewer.files.len(), 1);
+        assert_eq!(app.diff_viewer.files[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_render_diff_dialog_shows_turn_empty_state() {
+        let mut state = DiffViewerState::new();
+        state.open = true;
+        state.diff_type = DiffType::TurnDiff;
+        let area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        let mut buf = Buffer::empty(area);
+
+        diff_viewer::render_diff_dialog(&mut state, area, &mut buf);
+
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("No turn changes available yet."));
+    }
+
+    #[test]
     fn test_page_scroll() {
         let mut app = make_app();
         app.handle_key_event(key(KeyCode::PageUp));
@@ -421,6 +616,8 @@ mod tests {
             tool_count: 1,
             resource_count: 0,
             prompt_count: 0,
+            resources: vec![],
+            prompts: vec![],
             error_message: None,
             tools: vec![McpToolView {
                 name: "read_file".to_string(),
@@ -435,9 +632,8 @@ mod tests {
         assert_eq!(app.mcp_view.tool_search, "");
         assert_eq!(
             app.status_message.as_deref(),
-            Some("Reconnect is not wired yet in the Rust TUI.")
+            Some("Reconnecting MCP runtime...")
         );
-
         app.handle_key_event(key(KeyCode::Char('f')));
         assert_eq!(app.mcp_view.tool_search, "f");
 
@@ -446,6 +642,43 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Esc));
         assert!(!app.mcp_view.open);
+    }
+
+    #[test]
+    fn test_mcp_view_render_shows_resources_and_prompts() {
+        let mut state = McpViewState::new();
+        state.open(vec![McpServerView {
+            name: "filesystem".to_string(),
+            transport: "stdio".to_string(),
+            status: McpViewStatus::Connected,
+            tool_count: 1,
+            resource_count: 2,
+            prompt_count: 1,
+            resources: vec!["workspace-root".to_string(), "project-config".to_string()],
+            prompts: vec!["summarize-workspace".to_string()],
+            error_message: None,
+            tools: vec![McpToolView {
+                name: "read_file".to_string(),
+                server: "filesystem".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: None,
+            }],
+        }]);
+        state.switch_pane();
+        state.switch_pane();
+
+        let area = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let mut buf = Buffer::empty(area);
+        mcp_view::render_mcp_view(&state, area, &mut buf);
+        let rendered = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("2 res"));
+        assert!(rendered.contains("1 prompts"));
     }
 
     #[test]
@@ -611,3 +844,6 @@ mod tests {
         assert_eq!(pr.options[3].key, 'n');
     }
 }
+
+
+
